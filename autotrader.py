@@ -32,8 +32,8 @@ MAX_ASK_NEAREST_TICK = MAXIMUM_ASK // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
 # Custom Config
 NUM_THREADS = 5
 LOT_SIZE = 100
-FUT_CAP_WEIGHT, ETF_CAP_WEIGHT, FUT_TIC_WEIGHT, ETF_TIC_WEIGHT = 0.2, 0.3, 0.5, 0.5
-
+# FUT_CAP_WEIGHT, ETF_CAP_WEIGHT, TIC_CAP_WEIGHT = 0.2, 0.3, 0.5
+FUT_CAP_WEIGHT, ETF_CAP_WEIGHT, TIC_CAP_WEIGHT = 0.2, 0.3, 0.5
 class AutoTrader(BaseAutoTrader):
     """Example Auto-trader.
 
@@ -91,10 +91,49 @@ class AutoTrader(BaseAutoTrader):
         self.logger.info(f"received order book for instrument {instrument} with sequence number {sequence_number}")
 
         if instrument == Instrument.FUTURE:
+            price_adjustment = - (self.position // LOT_SIZE) * TICK_SIZE_IN_CENTS
+            new_bid_price = bid_prices[0] + price_adjustment if bid_prices[0] != 0 else 0
+            new_ask_price = ask_prices[0] + price_adjustment if ask_prices[0] != 0 else 0
+
+            buy_total_cap, sell_total_cap = self.calculate_sides_capital()
+            is_buyer_market = buy_total_cap > sell_total_cap
+            is_seller_market = buy_total_cap < sell_total_cap
+
+            # Cancel any current orders if needed
+            # should_cancel_bid = self.bid_id != 0 and new_bid_price not in (self.bid_price, 0)
+            # if is_buy_market and should_cancel_bid:
+            #     self.send_cancel_order(self.ask_id) # cancel the reverse order 
+            #     self.send_cancel_order(self.bid_id) # cancel the current order 
+            #     self.bid_id = 0
+            # should_cancel_ask = self.ask_id != 0 and new_ask_price not in (self.ask_price, 0)
+            # if is_sell_market and should_cancel_ask:
+            #     self.send_cancel_order(self.bid_id) # cancel the reverse order 
+            #     self.send_cancel_order(self.ask_id) # cancel the current order 
+            #     self.ask_id = 0
+
+            # Execute available orders
+            should_buy = self.bid_id == 0 and new_bid_price != 0 and self.position < POSITION_LIMIT
+            if is_buyer_market and should_buy:
+                self.bid_id = next(self.order_ids)
+                self.bid_price = new_bid_price
+                order_size = min(LOT_SIZE, abs(POSITION_LIMIT-self.position))
+                self.send_insert_order(self.bid_id, Side.BUY, new_bid_price, order_size, Lifespan.FILL_AND_KILL)
+                self.bids.add(self.bid_id)
+                self.logger.info(f"sending buy order({self.bid_id}) at {new_bid_price} of size {order_size}")
+
+            should_sell = self.ask_id == 0 and new_ask_price != 0 and self.position > -POSITION_LIMIT
+            if is_seller_market and should_sell:
+                self.ask_id = next(self.order_ids)
+                self.ask_price = new_ask_price
+                order_size = min(LOT_SIZE, abs(-POSITION_LIMIT-self.position))
+                self.send_insert_order(self.ask_id, Side.SELL, new_ask_price, order_size, Lifespan.FILL_AND_KILL)
+                self.asks.add(self.ask_id)
+                self.logger.info(f"sending sell order({self.ask_id}) at {new_ask_price} of size {order_size}")
+
             # Update local order book
             self.fut_book[Side.ASK] = (ask_prices, ask_volumes)
             self.fut_book[Side.BID] = (bid_prices, bid_volumes)
-            self.execute_order_by_fut(bid_prices, ask_prices)
+            # self.execute_order_by_fut(bid_prices, ask_prices)
             
         elif instrument == Instrument.ETF:
             # Update local order book
@@ -164,18 +203,18 @@ class AutoTrader(BaseAutoTrader):
         etf_buy = self._get_total_capital(*self.etf_book[Side.BID])
         etf_sell = self._get_total_capital(*self.etf_book[Side.ASK])
     
-        fut_tic_buy = self._get_total_capital(*self.fut_tick[Side.BID])
-        fut_tic_sell = self._get_total_capital(*self.fut_tick[Side.ASK])
+        # fut_tic_buy = self._get_total_capital(*self.fut_tick[Side.BID])
+        # fut_tic_sell = self._get_total_capital(*self.fut_tick[Side.ASK])
 
         etf_tic_buy = self._get_total_capital(*self.etf_tick[Side.BID])
         etf_tic_sell = self._get_total_capital(*self.etf_tick[Side.ASK])
 
-        buy_total_cap = self._get_side_total_capital(fut_buy, etf_buy, fut_tic_buy, etf_tic_buy)
-        sell_total_cap = self._get_side_total_capital(fut_sell, etf_sell, fut_tic_sell, etf_tic_sell)
+        buy_total_cap = self._get_side_total_capital(fut_buy, etf_buy, etf_tic_buy)
+        sell_total_cap = self._get_side_total_capital(fut_sell, etf_sell,  etf_tic_sell)
         return (buy_total_cap, sell_total_cap)
 
-    def _get_side_total_capital(self, fut_cap, etf_cap, fut_tic_cap, etf_tic_cap):
-        return FUT_CAP_WEIGHT*fut_cap + ETF_CAP_WEIGHT*etf_cap + FUT_TIC_WEIGHT*fut_tic_cap + ETF_TIC_WEIGHT*etf_tic_cap
+    def _get_side_total_capital(self, fut_cap, etf_cap, etf_tic_cap):
+        return FUT_CAP_WEIGHT*fut_cap + ETF_CAP_WEIGHT*etf_cap + TIC_CAP_WEIGHT*(etf_tic_cap)
     
     def _get_total_capital(self, prices, vols):
         return sum(map(lambda x: x[0]*x[1], zip(prices, vols)))
@@ -235,15 +274,17 @@ class AutoTrader(BaseAutoTrader):
         """
         self.logger.info(f"received trade ticks for instrument {instrument} with sequence number {sequence_number}")
         
-        if instrument == Instrument.FUTURE:
-            # Update local order book
-            self.fut_tick[Side.ASK] = (ask_prices, ask_volumes)
-            self.fut_tick[Side.BID] = (bid_prices, bid_volumes)
-            self.execute_order_by_fut(bid_prices, ask_prices)
+        # if instrument == Instrument.FUTURE:
+        #     # Update local order book
+        #     self.fut_tick[Side.ASK] = (ask_prices, ask_volumes)
+        #     self.fut_tick[Side.BID] = (bid_prices, bid_volumes)
             
-        elif instrument == Instrument.ETF:
-            # Update local order book
-            self.etf_tick[Side.ASK] = (ask_prices, ask_volumes)
-            self.etf_tick[Side.BID] = (bid_prices, bid_volumes)
+        # elif instrument == Instrument.ETF:
+        #     # Update local order book
+            # self.etf_tick[Side.ASK] = (ask_prices, ask_volumes)
+            # self.etf_tick[Side.BID] = (bid_prices, bid_volumes)
+
+        self.etf_tick[Side.ASK] = (ask_prices, ask_volumes)
+        self.etf_tick[Side.BID] = (bid_prices, bid_volumes)
         
         # self.execute_etf_order(bid_prices, ask_prices, buy_total_cap, sell_total_cap)
