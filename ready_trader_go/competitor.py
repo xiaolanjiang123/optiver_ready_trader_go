@@ -265,7 +265,7 @@ class Competitor(ICompetitor, IOrderListener):
             return
 
         if volume < 1:
-            self.send_error(now, client_order_id, b"%d is not a valid volume")
+            self.send_error(now, client_order_id, b"%d is not a valid volume" % volume)
             return
 
         if self.active_volume + volume > self.active_volume_limit:
